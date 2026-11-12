@@ -1,0 +1,172 @@
+# Fork-only: build the iOS app under YOUR OWN Apple Developer account and upload it to TestFlight
+# (internal testing only), so it installs on an iPhone through the TestFlight app with full
+# HealthKit / App Group entitlements. No Mac and no sideloading tool needed.
+#
+# Not for upstream: the project itself ships no App Store / TestFlight build. This lives in a
+# personal fork and signs with the fork owner's account.
+#
+# One-time setup (see the step list in the run summary if something is missing):
+#   Repository VARIABLE  BUNDLE_ID_PREFIX        e.g. com.yourname; to REPLACE an installed copy in place
+#                                                (keeping its data) use that copy's prefix, which only
+#                                                works when it was signed by this same team
+#   Repository SECRETS   APPLE_TEAM_ID           10-character Team ID (developer.apple.com > Membership)
+#                        ASC_KEY_ID              App Store Connect API key id
+#                        ASC_ISSUER_ID           App Store Connect issuer id
+#                        ASC_KEY_P8              full text of the downloaded AuthKey_XXXX.p8
+#   Optional SECRETS     DEV_CERT_P12_BASE64     base64 of an "Apple Development" .p12; when present it is
+#                        DEV_CERT_P12_PASSWORD   reused, otherwise Xcode creates a fresh development
+#                                                certificate on every run (they pile up in your account).
+#
+# Signing: the project is CODE_SIGN_STYLE=Automatic, so `-allowProvisioningUpdates` with the API key
+# lets Xcode register the four bundle ids ($PREFIX.noop, .noop.widgets, .noop.watch,
+# .noop.watch.complications), enable HealthKit + App Groups, create group.$PREFIX.noop.staging and
+# the profiles. The export step uses cloud-managed distribution signing, which needs the API key to
+# have the Admin role.
+name: iOS TestFlight (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    if: github.repository != 'ryanbr/noop'
+    # iOS 26 Liquid Glass (glassEffect) needs the iOS 26 SDK -> Xcode 26 -> macos-26.
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      BUNDLE_ID_PREFIX: ${{ vars.BUNDLE_ID_PREFIX }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+    steps:
+      - name: Check configuration
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          missing=""
+          [ -n "$BUNDLE_ID_PREFIX" ] || missing="$missing variable:BUNDLE_ID_PREFIX"
+          [ -n "$TEAM_ID" ]          || missing="$missing secret:APPLE_TEAM_ID"
+          [ -n "$ASC_KEY_ID" ]       || missing="$missing secret:ASC_KEY_ID"
+          [ -n "$ASC_ISSUER_ID" ]    || missing="$missing secret:ASC_ISSUER_ID"
+          [ -n "$ASC_KEY_P8" ]       || missing="$missing secret:ASC_KEY_P8"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository settings:$missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+          # The project's own prefix works only if YOUR team can register com.noopapp.noop. It is kept
+          # possible on purpose: matching an already-installed copy's bundle id (signed by the same team)
+          # is what lets the TestFlight build replace it in place and keep its data.
+          case "$BUNDLE_ID_PREFIX" in
+            com.noopapp|com.noopapp.*)
+              echo "::warning::Using the project's own prefix; registration fails if another team owns it." ;;
+          esac
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Point the build at your account
+        run: |
+          # Gitignored override read by Config/BundleId.xcconfig.
+          printf 'BUNDLE_ID_PREFIX = %s\nDEVELOPMENT_TEAM = %s\n' "$BUNDLE_ID_PREFIX" "$TEAM_ID" \
+            > Config/BundleIdSecrets.xcconfig
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          # Answer TestFlight's export-compliance question in the build instead of on every upload:
+          # the app only uses OS-provided HTTPS, which is exempt. Applied to the generated plist only.
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" \
+            StrandiOS/Resources/Info.plist
+
+      - name: Install API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY_PATH"
+          echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Import development certificate (optional)
+        env:
+          P12_BASE64: ${{ secrets.DEV_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEV_CERT_P12_PASSWORD }}
+        if: env.P12_BASE64 != ''
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS=$(uuidgen)
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dev.p12"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/dev.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/dev.p12"
+
+      - name: Archive
+        run: |
+          # TestFlight needs a build number above every earlier upload of this version. Keep the
+          # project's number as the first component (so an upstream bump still sorts higher) and
+          # add this workflow's run number. One global setting, so the app and its extensions match.
+          BASE=$(grep -m1 'CURRENT_PROJECT_VERSION' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          BUILD="${BASE}.${GITHUB_RUN_NUMBER}"
+          echo "Build number: $BUILD"
+          xcodebuild archive \
+            -scheme NOOPiOS -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/NOOP.xcarchive" \
+            -derivedDataPath build/dd \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD"
+
+      - name: Export and upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/NOOP.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 Config/BundleIdSecrets.xcconfig
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
